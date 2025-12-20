@@ -5,10 +5,15 @@ Production-ready HTTP API for splitting multi-page PDFs by page ranges. Designed
 ## Features
 
 - Split PDFs by custom page ranges
-- RESTful API endpoint
+- **Two response modes:**
+  - JSON with direct download URLs (default, ideal for n8n)
+  - ZIP file with all PDFs (optional)
+- **Automatic cleanup** of old jobs (60-minute retention)
+- **Direct file streaming** for memory efficiency
+- RESTful API endpoints (split, download, manifest, delete)
 - File upload support (up to 50MB)
 - 1-indexed page numbers (page 1 = first page)
-- Comprehensive validation
+- Comprehensive validation and security (path traversal protection)
 - CORS enabled
 - Railway-ready deployment
 
@@ -58,17 +63,19 @@ Returns server status.
 }
 ```
 
-### Split PDF
+### Split PDF (Default: JSON with Download URLs)
 
 **POST** `/split`
 
-Splits a PDF file into multiple PDFs based on page ranges.
+Splits a PDF file into multiple PDFs based on page ranges and returns JSON with direct download URLs for each file.
 
 **Request:**
 - **Content-Type:** `multipart/form-data`
 - **Parameters:**
   - `file` (required): PDF file to split
   - `ranges` (required): JSON array of page ranges
+- **Query Parameters:**
+  - `format` (optional): Set to `zip` for ZIP file response (default: JSON)
 
 **Page Range Format:**
 ```typescript
@@ -79,7 +86,7 @@ Splits a PDF file into multiple PDFs based on page ranges.
 }
 ```
 
-**Example Request (curl):**
+**Example Request (JSON mode - default):**
 ```bash
 curl -X POST http://localhost:3000/split \
   -F "file=@./input/class_merged.pdf" \
@@ -90,40 +97,126 @@ curl -X POST http://localhost:3000/split \
   ]'
 ```
 
-**Success Response (200):**
+**Success Response (200) - JSON Mode:**
 ```json
 {
-  "success": true,
-  "message": "Successfully split PDF into 3 files",
+  "job_id": "1234567890123",
   "totalPages": 6,
+  "submissionCount": 3,
   "results": [
     {
       "submission_id": "0356",
-      "outputPath": "/tmp/pdf-splitter-output/1234567890/0356.pdf",
       "fileName": "0356.pdf",
-      "pageCount": 2
+      "pageCount": 2,
+      "download_url": "http://localhost:3000/jobs/1234567890123/0356.pdf"
     },
     {
       "submission_id": "0342",
-      "outputPath": "/tmp/pdf-splitter-output/1234567890/0342.pdf",
       "fileName": "0342.pdf",
-      "pageCount": 2
+      "pageCount": 2,
+      "download_url": "http://localhost:3000/jobs/1234567890123/0342.pdf"
     },
     {
       "submission_id": "0335",
-      "outputPath": "/tmp/pdf-splitter-output/1234567890/0335.pdf",
       "fileName": "0335.pdf",
-      "pageCount": 2
+      "pageCount": 2,
+      "download_url": "http://localhost:3000/jobs/1234567890123/0335.pdf"
     }
   ]
 }
 ```
+
+**Example Request (ZIP mode - optional):**
+```bash
+curl -X POST "http://localhost:3000/split?format=zip" \
+  -F "file=@./input/class_merged.pdf" \
+  -F 'ranges=[
+    {"submission_id":"0356","start_page":1,"end_page":2},
+    {"submission_id":"0342","start_page":3,"end_page":4},
+    {"submission_id":"0335","start_page":5,"end_page":6}
+  ]' \
+  -o split_submissions.zip
+```
+
+**Success Response (200) - ZIP Mode:**
+- **Content-Type:** `application/zip`
+- **Content-Disposition:** `attachment; filename="split_submissions.zip"`
+- **Body:** Binary ZIP file containing all PDFs and manifest.json
 
 **Error Response (400/500):**
 ```json
 {
   "success": false,
   "error": "Error message here"
+}
+```
+
+### Download PDF File
+
+**GET** `/jobs/:jobId/:fileName`
+
+Download a specific split PDF file from a job.
+
+**Example:**
+```bash
+curl -O http://localhost:3000/jobs/1234567890123/0356.pdf
+```
+
+**Response:**
+- **Content-Type:** `application/pdf`
+- Binary PDF file stream
+
+**Error Response (404):**
+```json
+{
+  "success": false,
+  "error": "Job 1234567890123 not found. It may have expired (jobs are kept for 60 minutes)."
+}
+```
+
+### Get Job Manifest
+
+**GET** `/jobs/:jobId/manifest.json`
+
+Retrieve the manifest for a specific job containing metadata about all split PDFs.
+
+**Example:**
+```bash
+curl http://localhost:3000/jobs/1234567890123/manifest.json
+```
+
+**Response:**
+```json
+{
+  "totalPages": 6,
+  "submissionCount": 3,
+  "results": [
+    {
+      "submission_id": "0356",
+      "fileName": "0356.pdf",
+      "pageCount": 2,
+      "download_url": "http://localhost:3000/jobs/1234567890123/0356.pdf"
+    }
+  ]
+}
+```
+
+### Delete Job
+
+**DELETE** `/jobs/:jobId`
+
+Manually delete a job and its associated files before automatic expiration.
+
+**Example:**
+```bash
+curl -X DELETE http://localhost:3000/jobs/1234567890123
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Job 1234567890123 deleted successfully"
 }
 ```
 
@@ -140,7 +233,9 @@ The API validates all inputs:
 
 ## Usage with n8n
 
-### Method 1: HTTP Request Node
+The JSON mode (default) is the most efficient for n8n workflows since you get direct download URLs for each PDF without needing to unzip files.
+
+### Method 1: HTTP Request Node (Recommended)
 
 1. Add an **HTTP Request** node
 2. Configure:
@@ -150,11 +245,13 @@ The API validates all inputs:
    - **Body Parameters:**
      - Add `file` parameter with binary file data
      - Add `ranges` parameter with JSON array
+3. The response will contain download URLs for each PDF
+4. Use another HTTP Request node to download individual PDFs as needed
 
-### Method 2: Code Node Example
+### Method 2: Code Node Example (JSON Mode)
 
 ```javascript
-// In n8n Code node
+// In n8n Code node - Split PDF and get download URLs
 const FormData = require('form-data');
 const form = new FormData();
 
@@ -171,14 +268,69 @@ const ranges = [
 ];
 form.append('ranges', JSON.stringify(ranges));
 
-// Make request
+// Make request (default JSON mode)
 const response = await axios.post(
   'https://your-railway-app.railway.app/split',
   form,
   { headers: form.getHeaders() }
 );
 
-return response.data;
+// response.data contains job_id and download URLs
+// {
+//   job_id: "1234567890123",
+//   totalPages: 4,
+//   submissionCount: 2,
+//   results: [
+//     { submission_id: "0356", fileName: "0356.pdf", pageCount: 2, download_url: "..." },
+//     { submission_id: "0342", fileName: "0342.pdf", pageCount: 2, download_url: "..." }
+//   ]
+// }
+
+return response.data.results.map(result => ({
+  json: {
+    submission_id: result.submission_id,
+    download_url: result.download_url,
+    pageCount: result.pageCount
+  }
+}));
+```
+
+### Method 3: Download Individual PDFs in n8n
+
+After getting the JSON response, use an HTTP Request node to download specific PDFs:
+
+```javascript
+// In n8n HTTP Request node
+// URL: {{ $json.download_url }}
+// Method: GET
+// Response Format: File
+
+// This will download the PDF file directly
+```
+
+### Method 4: ZIP Mode (Optional)
+
+If you prefer ZIP files, add `?format=zip` to the URL:
+
+```javascript
+// Make request with ZIP format
+const response = await axios.post(
+  'https://your-railway-app.railway.app/split?format=zip',
+  form,
+  {
+    headers: form.getHeaders(),
+    responseType: 'arraybuffer'
+  }
+);
+
+// response.data contains the ZIP file as a buffer
+return [{
+  binary: {
+    data: Buffer.from(response.data),
+    fileName: 'split_submissions.zip',
+    mimeType: 'application/zip'
+  }
+}];
 ```
 
 ## Deployment to Railway
@@ -241,10 +393,40 @@ npm start
 # Health check
 curl http://localhost:3000/health
 
-# Split PDF (replace with your file path)
+# Split PDF and get download URLs (JSON mode - default)
 curl -X POST http://localhost:3000/split \
   -F "file=@./path/to/your.pdf" \
   -F 'ranges=[{"submission_id":"test","start_page":1,"end_page":1}]'
+
+# Response will contain:
+# {
+#   "job_id": "1234567890123",
+#   "totalPages": 1,
+#   "submissionCount": 1,
+#   "results": [
+#     {
+#       "submission_id": "test",
+#       "fileName": "test.pdf",
+#       "pageCount": 1,
+#       "download_url": "http://localhost:3000/jobs/1234567890123/test.pdf"
+#     }
+#   ]
+# }
+
+# Download a specific PDF
+curl -O http://localhost:3000/jobs/1234567890123/test.pdf
+
+# Get the job manifest
+curl http://localhost:3000/jobs/1234567890123/manifest.json
+
+# Clean up the job
+curl -X DELETE http://localhost:3000/jobs/1234567890123
+
+# Or use ZIP mode
+curl -X POST "http://localhost:3000/split?format=zip" \
+  -F "file=@./path/to/your.pdf" \
+  -F 'ranges=[{"submission_id":"test","start_page":1,"end_page":1}]' \
+  -o result.zip
 ```
 
 ## Project Structure
@@ -261,13 +443,31 @@ pdf-splitter/
 └── README.md            # This file
 ```
 
-## Response File Paths
+## Response Formats
 
-The API returns file paths to the split PDFs. These are stored in the system's temp directory:
-- **Local:** `/tmp/pdf-splitter-output/<timestamp>/`
-- **Railway:** Ephemeral storage (files cleared on restart)
+The API supports two response formats:
 
-**Note:** For production use, consider integrating cloud storage (S3, Google Cloud Storage) to persist the split PDFs and return download URLs instead of local paths.
+### Default: JSON with Download URLs (Recommended for n8n)
+
+Returns JSON with direct download URLs for each split PDF. This is the most efficient format for automation workflows since you can:
+- Download only the PDFs you need
+- Process PDFs individually in your workflow
+- Retry individual downloads if needed
+
+**Job Lifecycle:**
+- Each split operation creates a unique `job_id`
+- PDFs are stored in `/tmp/pdf-splitter-output/<job_id>/`
+- Jobs are automatically deleted after **60 minutes**
+- You can manually delete a job using `DELETE /jobs/:jobId`
+
+**Automatic Cleanup:**
+- On each new split request, the API automatically cleans up jobs older than 60 minutes
+- This prevents disk space accumulation on Railway or other hosting platforms
+- No manual intervention required
+
+### Optional: ZIP Format
+
+Use `?format=zip` query parameter to get a ZIP file containing all PDFs and manifest.json. The ZIP is streamed directly to the client, avoiding large memory usage. Files are cleaned up immediately after the ZIP is sent.
 
 ## Error Handling
 

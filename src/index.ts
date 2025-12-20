@@ -42,21 +42,42 @@ export type SplitResult = {
 };
 
 /**
- * Manifest entry for each submission in the ZIP
+ * Manifest entry for each submission (used in both ZIP and JSON modes)
  */
 type ManifestEntry = {
   submission_id: string;
   fileName: string;
   pageCount: number;
+  download_url?: string; // Only present in JSON mode
 };
 
 /**
- * Manifest file structure included in ZIP
+ * Manifest file structure
  */
 type Manifest = {
   totalPages: number;
   submissionCount: number;
   results: ManifestEntry[];
+};
+
+/**
+ * API response for JSON mode (with download URLs)
+ */
+type JsonSplitResponse = {
+  job_id: string;
+  totalPages: number;
+  submissionCount: number;
+  results: ManifestEntry[];
+};
+
+/**
+ * Job registry entry for tracking temp directories
+ */
+type JobEntry = {
+  jobId: string;
+  directory: string;
+  createdAt: number;
+  manifest: Manifest;
 };
 
 /**
@@ -80,6 +101,12 @@ type ErrorResponse = {
 // Initialize Express app
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Job registry for tracking temporary directories
+const jobRegistry = new Map<string, JobEntry>();
+
+// Job retention time: 60 minutes
+const JOB_RETENTION_MS = 60 * 60 * 1000;
 
 // Configure middleware
 app.use(cors());
@@ -154,6 +181,84 @@ async function ensureOutputDirectory(outputDir: string): Promise<void> {
   if (!existsSync(outputDir)) {
     await mkdir(outputDir, { recursive: true });
   }
+}
+
+/**
+ * Validates jobId to prevent path traversal attacks
+ */
+function isValidJobId(jobId: string): boolean {
+  // Only allow alphanumeric characters and hyphens
+  return /^[a-zA-Z0-9-]+$/.test(jobId);
+}
+
+/**
+ * Validates fileName to prevent path traversal attacks
+ */
+function isValidFileName(fileName: string): boolean {
+  // Only allow alphanumeric, dash, underscore, and .pdf extension
+  return /^[a-zA-Z0-9_-]+\.pdf$/.test(fileName);
+}
+
+/**
+ * Cleans up old job directories (older than JOB_RETENTION_MS)
+ */
+async function cleanupOldJobs(): Promise<void> {
+  const now = Date.now();
+  const jobsToDelete: string[] = [];
+
+  // Find jobs older than retention time
+  for (const [jobId, job] of jobRegistry.entries()) {
+    if (now - job.createdAt > JOB_RETENTION_MS) {
+      jobsToDelete.push(jobId);
+    }
+  }
+
+  // Delete old jobs
+  for (const jobId of jobsToDelete) {
+    const job = jobRegistry.get(jobId);
+    if (job) {
+      try {
+        await rm(job.directory, { recursive: true, force: true });
+        jobRegistry.delete(jobId);
+        console.log(`✓ Cleaned up old job: ${jobId}`);
+      } catch (err) {
+        console.error(`Failed to clean up job ${jobId}:`, err);
+      }
+    }
+  }
+
+  if (jobsToDelete.length > 0) {
+    console.log(`✓ Cleaned up ${jobsToDelete.length} old job(s)`);
+  }
+}
+
+/**
+ * Deletes a specific job by jobId
+ */
+async function deleteJob(jobId: string): Promise<boolean> {
+  const job = jobRegistry.get(jobId);
+  if (!job) {
+    return false;
+  }
+
+  try {
+    await rm(job.directory, { recursive: true, force: true });
+    jobRegistry.delete(jobId);
+    console.log(`✓ Deleted job: ${jobId}`);
+    return true;
+  } catch (err) {
+    console.error(`Failed to delete job ${jobId}:`, err);
+    throw err;
+  }
+}
+
+/**
+ * Builds the base URL from the request
+ */
+function getBaseUrl(req: Request): string {
+  const protocol = req.get('x-forwarded-proto') || req.protocol || 'http';
+  const host = req.get('host') || `localhost:${PORT}`;
+  return `${protocol}://${host}`;
 }
 
 /**
@@ -265,12 +370,19 @@ app.get('/health', (req: Request, res: Response) => {
  * Accepts:
  * - file: PDF file (multipart/form-data)
  * - ranges: JSON array of page ranges (can be sent as form field or in request body)
+ * - format: Optional query param "zip" for ZIP format (default: JSON with URLs)
  *
  * Returns:
- * - ZIP file containing split PDFs and manifest.json
+ * - Default: JSON with download URLs for each PDF
+ * - ?format=zip: ZIP file containing split PDFs and manifest.json
  *
- * Example curl request:
+ * Example curl request (JSON mode):
  * curl -X POST http://localhost:3000/split \
+ *   -F "file=@./input/class_merged.pdf" \
+ *   -F 'ranges=[{"submission_id":"0356","start_page":1,"end_page":2}]'
+ *
+ * Example curl request (ZIP mode):
+ * curl -X POST "http://localhost:3000/split?format=zip" \
  *   -F "file=@./input/class_merged.pdf" \
  *   -F 'ranges=[{"submission_id":"0356","start_page":1,"end_page":2}]' \
  *   -o output.zip
@@ -280,8 +392,12 @@ app.post(
   upload.single('file'),
   async (req: Request, res: Response, next: NextFunction) => {
     let outputDir: string | null = null;
+    let jobId: string | null = null;
 
     try {
+      // Clean up old jobs before processing
+      await cleanupOldJobs();
+
       // Validate file upload
       if (!req.file) {
         return res.status(400).json({
@@ -309,13 +425,20 @@ app.post(
         } as ErrorResponse);
       }
 
-      // Create output directory (use temp directory for Railway)
-      outputDir = join(tmpdir(), 'pdf-splitter-output', Date.now().toString());
+      // Determine response format
+      const format = req.query.format as string;
+      const useZipFormat = format === 'zip';
+
+      // Create job ID and output directory
+      jobId = Date.now().toString();
+      outputDir = join(tmpdir(), 'pdf-splitter-output', jobId);
       await ensureOutputDirectory(outputDir);
 
       console.log(`\nProcessing PDF split request:`);
+      console.log(`- Job ID: ${jobId}`);
       console.log(`- File size: ${req.file.size} bytes`);
       console.log(`- Ranges count: ${ranges.length}`);
+      console.log(`- Format: ${useZipFormat ? 'ZIP' : 'JSON'}`);
       console.log(`- Output dir: ${outputDir}`);
 
       // Process the PDF split
@@ -327,7 +450,10 @@ app.post(
 
       console.log(`✓ Split complete: ${results.length} files created`);
 
-      // Create manifest
+      // Build base URL for download links
+      const baseUrl = getBaseUrl(req);
+
+      // Create manifest with download URLs
       const manifest: Manifest = {
         totalPages,
         submissionCount: results.length,
@@ -335,58 +461,98 @@ app.post(
           submission_id: r.submission_id,
           fileName: r.fileName,
           pageCount: r.pageCount,
+          download_url: `${baseUrl}/jobs/${jobId}/${r.fileName}`,
         })),
       };
 
-      // Set response headers for ZIP download
-      res.setHeader('Content-Type', 'application/zip');
-      res.setHeader('Content-Disposition', 'attachment; filename="split_submissions.zip"');
+      if (useZipFormat) {
+        // ZIP MODE: Stream ZIP file and clean up immediately after
+        console.log(`✓ Returning ZIP format`);
 
-      // Create ZIP archive
-      const archive = archiver('zip', {
-        zlib: { level: 9 }, // Maximum compression
-      });
+        // Set response headers for ZIP download
+        res.setHeader('Content-Type', 'application/zip');
+        res.setHeader('Content-Disposition', 'attachment; filename="split_submissions.zip"');
 
-      // Handle archive errors
-      archive.on('error', (err) => {
-        console.error('Archive error:', err);
-        throw err;
-      });
+        // Create ZIP archive
+        const archive = archiver('zip', {
+          zlib: { level: 9 }, // Maximum compression
+        });
 
-      // Pipe archive to response
-      archive.pipe(res);
+        // Handle archive errors
+        archive.on('error', (err) => {
+          console.error('Archive error:', err);
+          throw err;
+        });
 
-      // Add each PDF to the ZIP
-      for (const result of results) {
-        archive.file(result.outputPath, { name: result.fileName });
-      }
+        // Pipe archive to response
+        archive.pipe(res);
 
-      // Add manifest.json to the ZIP
-      archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
-
-      console.log(`✓ Streaming ZIP with ${results.length} PDFs + manifest.json`);
-
-      // Finalize the archive (this will trigger streaming to the client)
-      await archive.finalize();
-
-      console.log(`✓ ZIP sent successfully\n`);
-
-      // Clean up temp files after streaming completes
-      // Use setImmediate to avoid blocking the response
-      setImmediate(async () => {
-        if (outputDir) {
-          try {
-            await rm(outputDir, { recursive: true, force: true });
-            console.log(`✓ Cleaned up temp directory: ${outputDir}`);
-          } catch (err) {
-            console.error(`Failed to clean up ${outputDir}:`, err);
-          }
+        // Add each PDF to the ZIP
+        for (const result of results) {
+          archive.file(result.outputPath, { name: result.fileName });
         }
-      });
+
+        // Add manifest.json to the ZIP (without download_url in ZIP mode)
+        const zipManifest = {
+          totalPages: manifest.totalPages,
+          submissionCount: manifest.submissionCount,
+          results: manifest.results.map(r => ({
+            submission_id: r.submission_id,
+            fileName: r.fileName,
+            pageCount: r.pageCount,
+          })),
+        };
+        archive.append(JSON.stringify(zipManifest, null, 2), { name: 'manifest.json' });
+
+        console.log(`✓ Streaming ZIP with ${results.length} PDFs + manifest.json`);
+
+        // Finalize the archive (this will trigger streaming to the client)
+        await archive.finalize();
+
+        console.log(`✓ ZIP sent successfully\n`);
+
+        // Clean up temp files immediately in ZIP mode
+        setImmediate(async () => {
+          if (outputDir) {
+            try {
+              await rm(outputDir, { recursive: true, force: true });
+              console.log(`✓ Cleaned up temp directory: ${outputDir}`);
+            } catch (err) {
+              console.error(`Failed to clean up ${outputDir}:`, err);
+            }
+          }
+        });
+
+      } else {
+        // JSON MODE: Register job and return URLs
+        console.log(`✓ Returning JSON format with download URLs`);
+
+        // Register the job in the registry
+        jobRegistry.set(jobId, {
+          jobId,
+          directory: outputDir,
+          createdAt: Date.now(),
+          manifest,
+        });
+
+        // Return JSON response with download URLs
+        const response: JsonSplitResponse = {
+          job_id: jobId,
+          totalPages: manifest.totalPages,
+          submissionCount: manifest.submissionCount,
+          results: manifest.results,
+        };
+
+        console.log(`✓ Job registered: ${jobId}`);
+        console.log(`✓ Files available for 60 minutes\n`);
+
+        res.json(response);
+      }
 
     } catch (error) {
       // Clean up on error
-      if (outputDir) {
+      if (outputDir && !jobId) {
+        // Only clean up if job wasn't registered
         try {
           await rm(outputDir, { recursive: true, force: true });
         } catch (err) {
@@ -399,12 +565,158 @@ app.post(
 );
 
 /**
+ * Download a specific PDF file from a job
+ *
+ * GET /jobs/:jobId/:fileName
+ *
+ * Returns the PDF file with proper content-type headers
+ */
+app.get('/jobs/:jobId/:fileName', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { jobId, fileName } = req.params;
+
+    // Validate jobId and fileName to prevent path traversal
+    if (!isValidJobId(jobId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid job ID format',
+      } as ErrorResponse);
+    }
+
+    if (!isValidFileName(fileName)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid file name format',
+      } as ErrorResponse);
+    }
+
+    // Check if job exists
+    const job = jobRegistry.get(jobId);
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        error: `Job ${jobId} not found. It may have expired (jobs are kept for 60 minutes).`,
+      } as ErrorResponse);
+    }
+
+    // Build file path
+    const filePath = join(job.directory, fileName);
+
+    // Check if file exists
+    if (!existsSync(filePath)) {
+      return res.status(404).json({
+        success: false,
+        error: `File ${fileName} not found in job ${jobId}`,
+      } as ErrorResponse);
+    }
+
+    // Stream the PDF file
+    console.log(`✓ Streaming file: ${fileName} from job ${jobId}`);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+
+    const fileStream = createReadStream(filePath);
+    fileStream.pipe(res);
+
+    fileStream.on('error', (err) => {
+      console.error(`Error streaming file ${fileName}:`, err);
+      next(err);
+    });
+
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * Get the manifest for a specific job
+ *
+ * GET /jobs/:jobId/manifest.json
+ *
+ * Returns the manifest JSON with metadata about all split PDFs
+ */
+app.get('/jobs/:jobId/manifest.json', async (req: Request, res: Response) => {
+  try {
+    const { jobId } = req.params;
+
+    // Validate jobId
+    if (!isValidJobId(jobId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid job ID format',
+      } as ErrorResponse);
+    }
+
+    // Check if job exists
+    const job = jobRegistry.get(jobId);
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        error: `Job ${jobId} not found. It may have expired (jobs are kept for 60 minutes).`,
+      } as ErrorResponse);
+    }
+
+    // Return the manifest
+    console.log(`✓ Returning manifest for job ${jobId}`);
+    res.json(job.manifest);
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to retrieve manifest',
+    } as ErrorResponse);
+  }
+});
+
+/**
+ * Delete a specific job and its files
+ *
+ * DELETE /jobs/:jobId
+ *
+ * Manually clean up a job before the automatic 60-minute expiration
+ */
+app.delete('/jobs/:jobId', async (req: Request, res: Response) => {
+  try {
+    const { jobId } = req.params;
+
+    // Validate jobId
+    if (!isValidJobId(jobId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid job ID format',
+      } as ErrorResponse);
+    }
+
+    // Delete the job
+    const deleted = await deleteJob(jobId);
+
+    if (!deleted) {
+      return res.status(404).json({
+        success: false,
+        error: `Job ${jobId} not found`,
+      } as ErrorResponse);
+    }
+
+    res.json({
+      success: true,
+      message: `Job ${jobId} deleted successfully`,
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to delete job',
+    } as ErrorResponse);
+  }
+});
+
+/**
  * 404 handler
  */
 app.use((req: Request, res: Response) => {
   res.status(404).json({
     success: false,
-    error: 'Endpoint not found. Available endpoints: GET /health, POST /split',
+    error: 'Endpoint not found. Available endpoints: GET /health, POST /split, GET /jobs/:jobId/:fileName, GET /jobs/:jobId/manifest.json, DELETE /jobs/:jobId',
   } as ErrorResponse);
 });
 
