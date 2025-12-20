@@ -15,10 +15,11 @@ import express, { Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import cors from 'cors';
 import { PDFDocument } from 'pdf-lib';
-import { writeFile, mkdir, unlink } from 'fs/promises';
-import { existsSync } from 'fs';
+import { writeFile, mkdir, unlink, rm } from 'fs/promises';
+import { existsSync, createReadStream } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import archiver from 'archiver';
 
 /**
  * Represents a page range for splitting the PDF
@@ -41,7 +42,25 @@ export type SplitResult = {
 };
 
 /**
- * API response for successful split operation
+ * Manifest entry for each submission in the ZIP
+ */
+type ManifestEntry = {
+  submission_id: string;
+  fileName: string;
+  pageCount: number;
+};
+
+/**
+ * Manifest file structure included in ZIP
+ */
+type Manifest = {
+  totalPages: number;
+  submissionCount: number;
+  results: ManifestEntry[];
+};
+
+/**
+ * API response for successful split operation (legacy, not used in ZIP mode)
  */
 type SplitResponse = {
   success: true;
@@ -247,15 +266,21 @@ app.get('/health', (req: Request, res: Response) => {
  * - file: PDF file (multipart/form-data)
  * - ranges: JSON array of page ranges (can be sent as form field or in request body)
  *
+ * Returns:
+ * - ZIP file containing split PDFs and manifest.json
+ *
  * Example curl request:
  * curl -X POST http://localhost:3000/split \
  *   -F "file=@./input/class_merged.pdf" \
- *   -F 'ranges=[{"submission_id":"0356","start_page":1,"end_page":2}]'
+ *   -F 'ranges=[{"submission_id":"0356","start_page":1,"end_page":2}]' \
+ *   -o output.zip
  */
 app.post(
   '/split',
   upload.single('file'),
   async (req: Request, res: Response, next: NextFunction) => {
+    let outputDir: string | null = null;
+
     try {
       // Validate file upload
       if (!req.file) {
@@ -285,7 +310,7 @@ app.post(
       }
 
       // Create output directory (use temp directory for Railway)
-      const outputDir = join(tmpdir(), 'pdf-splitter-output', Date.now().toString());
+      outputDir = join(tmpdir(), 'pdf-splitter-output', Date.now().toString());
       await ensureOutputDirectory(outputDir);
 
       console.log(`\nProcessing PDF split request:`);
@@ -300,31 +325,74 @@ app.post(
         outputDir
       );
 
-      // Return success response
-      const response: SplitResponse = {
-        success: true,
-        message: `Successfully split PDF into ${results.length} files`,
+      console.log(`✓ Split complete: ${results.length} files created`);
+
+      // Create manifest
+      const manifest: Manifest = {
         totalPages,
-        results,
+        submissionCount: results.length,
+        results: results.map(r => ({
+          submission_id: r.submission_id,
+          fileName: r.fileName,
+          pageCount: r.pageCount,
+        })),
       };
 
-      console.log(`✓ Split complete: ${results.length} files created\n`);
+      // Set response headers for ZIP download
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', 'attachment; filename="split_submissions.zip"');
 
-      res.json(response);
+      // Create ZIP archive
+      const archive = archiver('zip', {
+        zlib: { level: 9 }, // Maximum compression
+      });
 
-      // Clean up temp files after response (optional, Railway will handle cleanup)
-      // Uncomment if you want immediate cleanup:
-      // setTimeout(async () => {
-      //   for (const result of results) {
-      //     try {
-      //       await unlink(result.outputPath);
-      //     } catch (err) {
-      //       console.error(`Failed to clean up ${result.outputPath}:`, err);
-      //     }
-      //   }
-      // }, 5000);
+      // Handle archive errors
+      archive.on('error', (err) => {
+        console.error('Archive error:', err);
+        throw err;
+      });
+
+      // Pipe archive to response
+      archive.pipe(res);
+
+      // Add each PDF to the ZIP
+      for (const result of results) {
+        archive.file(result.outputPath, { name: result.fileName });
+      }
+
+      // Add manifest.json to the ZIP
+      archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
+
+      console.log(`✓ Streaming ZIP with ${results.length} PDFs + manifest.json`);
+
+      // Finalize the archive (this will trigger streaming to the client)
+      await archive.finalize();
+
+      console.log(`✓ ZIP sent successfully\n`);
+
+      // Clean up temp files after streaming completes
+      // Use setImmediate to avoid blocking the response
+      setImmediate(async () => {
+        if (outputDir) {
+          try {
+            await rm(outputDir, { recursive: true, force: true });
+            console.log(`✓ Cleaned up temp directory: ${outputDir}`);
+          } catch (err) {
+            console.error(`Failed to clean up ${outputDir}:`, err);
+          }
+        }
+      });
 
     } catch (error) {
+      // Clean up on error
+      if (outputDir) {
+        try {
+          await rm(outputDir, { recursive: true, force: true });
+        } catch (err) {
+          console.error(`Failed to clean up ${outputDir}:`, err);
+        }
+      }
       next(error);
     }
   }
