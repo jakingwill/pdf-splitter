@@ -7,12 +7,13 @@
 
 import { S3Client, PutObjectCommand, DeleteObjectCommand, HeadBucketCommand } from '@aws-sdk/client-s3';
 
-// R2 Configuration from environment variables
-const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || 'f5356646acd5bdb980d4f90195ba873a';
-const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
-const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
-const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME || 'pdf-splitter-storage';
-const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || 'https://pub-bee39d9da3be44ad88f107fe87be5a16.r2.dev';
+const clean = (v?: string) => (v ?? '').trim();
+
+const R2_ACCOUNT_ID = clean(process.env.R2_ACCOUNT_ID);
+const R2_ACCESS_KEY_ID = clean(process.env.R2_ACCESS_KEY_ID);
+const R2_SECRET_ACCESS_KEY = clean(process.env.R2_SECRET_ACCESS_KEY);
+const R2_BUCKET_NAME = clean(process.env.R2_BUCKET_NAME);
+const R2_PUBLIC_URL = clean(process.env.R2_PUBLIC_URL);
 
 // Validate configuration on startup
 function validateR2Config(): { valid: boolean; errors: string[] } {
