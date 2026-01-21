@@ -20,6 +20,8 @@ import { existsSync, createReadStream } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import archiver from 'archiver';
+import { uploadToR2, deleteFromR2, generateR2Key, testR2Connection, R2_ENABLED } from './r2-client.js';
+import { Server } from 'http';
 
 /**
  * Represents a page range for splitting the PDF
@@ -39,6 +41,8 @@ export type SplitResult = {
   outputPath: string;
   fileName: string;
   pageCount: number;
+  r2Url?: string; // R2 public URL
+  r2Key?: string; // R2 storage key
 };
 
 /**
@@ -71,13 +75,14 @@ type JsonSplitResponse = {
 };
 
 /**
- * Job registry entry for tracking temp directories
+ * Job registry entry for tracking temp directories and R2 keys
  */
 type JobEntry = {
   jobId: string;
   directory: string;
   createdAt: number;
   manifest: Manifest;
+  r2Keys: string[]; // R2 storage keys for cleanup
 };
 
 /**
@@ -100,7 +105,8 @@ type ErrorResponse = {
 
 // Initialize Express app
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const HOST = '0.0.0.0'; // Bind to all interfaces for Railway
 
 // Job registry for tracking temporary directories
 const jobRegistry = new Map<string, JobEntry>();
@@ -108,10 +114,26 @@ const jobRegistry = new Map<string, JobEntry>();
 // Job retention time: 60 minutes
 const JOB_RETENTION_MS = 60 * 60 * 1000;
 
+// Graceful shutdown state
+let isShuttingDown = false;
+let server: Server;
+
 // Configure middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Middleware to reject requests during shutdown
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (isShuttingDown) {
+    res.setHeader('Connection', 'close');
+    return res.status(503).json({
+      success: false,
+      error: 'Server is shutting down',
+    } as ErrorResponse);
+  }
+  next();
+});
 
 // Configure multer for file uploads (store in memory for processing)
 const upload = multer({
@@ -218,6 +240,19 @@ async function cleanupOldJobs(): Promise<void> {
     const job = jobRegistry.get(jobId);
     if (job) {
       try {
+        // Delete R2 files first
+        if (job.r2Keys && job.r2Keys.length > 0) {
+          for (const r2Key of job.r2Keys) {
+            try {
+              await deleteFromR2(r2Key);
+              console.log(`  ✓ Deleted from R2: ${r2Key}`);
+            } catch (err) {
+              console.error(`  ⚠ Failed to delete from R2: ${r2Key}`, err);
+            }
+          }
+        }
+
+        // Delete local directory
         await rm(job.directory, { recursive: true, force: true });
         jobRegistry.delete(jobId);
         console.log(`✓ Cleaned up old job: ${jobId}`);
@@ -242,6 +277,19 @@ async function deleteJob(jobId: string): Promise<boolean> {
   }
 
   try {
+    // Delete R2 files first
+    if (job.r2Keys && job.r2Keys.length > 0) {
+      for (const r2Key of job.r2Keys) {
+        try {
+          await deleteFromR2(r2Key);
+          console.log(`  ✓ Deleted from R2: ${r2Key}`);
+        } catch (err) {
+          console.error(`  ⚠ Failed to delete from R2: ${r2Key}`, err);
+        }
+      }
+    }
+
+    // Delete local directory
     await rm(job.directory, { recursive: true, force: true });
     jobRegistry.delete(jobId);
     console.log(`✓ Deleted job: ${jobId}`);
@@ -267,13 +315,17 @@ function getBaseUrl(req: Request): string {
  * @param pdfBuffer - Buffer containing the input PDF data
  * @param ranges - Array of page ranges to extract (1-indexed)
  * @param outputDir - Directory where split PDFs will be saved
+ * @param jobId - Job ID for R2 storage path
+ * @param uploadToR2Storage - Whether to upload to R2 (true for JSON mode, false for ZIP mode)
  * @returns Object containing total pages and array of split results
  * @throws Error if PDF cannot be parsed or any range is invalid
  */
 async function splitPdfFromBuffer(
   pdfBuffer: Buffer,
   ranges: PageRange[],
-  outputDir: string
+  outputDir: string,
+  jobId: string,
+  uploadToR2Storage: boolean = true
 ): Promise<{ totalPages: number; results: SplitResult[] }> {
   // Step 1: Load the PDF document from buffer
   let sourcePdf: PDFDocument;
@@ -331,7 +383,7 @@ async function splitPdfFromBuffer(
 
     try {
       await writeFile(outputPath, pdfBytes);
-      console.log(`  ✓ Saved to "${outputPath}"`);
+      console.log(`  ✓ Saved locally: ${outputPath}`);
     } catch (error) {
       throw new Error(
         `Failed to write output PDF "${outputPath}": ${
@@ -340,11 +392,35 @@ async function splitPdfFromBuffer(
       );
     }
 
+    // Step 6: Upload to R2 if requested (for persistent storage in JSON mode)
+    let r2Url: string | undefined;
+    let r2Key: string | undefined;
+
+    if (uploadToR2Storage && R2_ENABLED) {
+      try {
+        r2Key = generateR2Key(jobId, fileName);
+        r2Url = await uploadToR2(r2Key, Buffer.from(pdfBytes));
+        console.log(`  ✓ Uploaded to R2: ${r2Url}`);
+      } catch (error) {
+        console.error(`  ✗ Failed to upload ${fileName} to R2:`);
+        console.error(`    Error: ${error instanceof Error ? error.message : String(error)}`);
+        if (error instanceof Error && error.stack) {
+          console.error(`    Stack: ${error.stack}`);
+        }
+        // Don't fail the whole operation if R2 upload fails
+        // Fall back to local file serving
+      }
+    } else if (uploadToR2Storage && !R2_ENABLED) {
+      console.log(`  ⚠ R2 disabled - using local storage for ${fileName}`);
+    }
+
     results.push({
       submission_id,
       outputPath,
       fileName,
       pageCount: end_page - start_page + 1,
+      r2Url,
+      r2Key,
     });
   }
 
@@ -352,13 +428,30 @@ async function splitPdfFromBuffer(
 }
 
 /**
- * Health check endpoint
+ * Health check endpoint - must respond quickly without blocking operations
  */
 app.get('/health', (req: Request, res: Response) => {
   res.json({
     status: 'healthy',
     service: 'pdf-splitter-api',
     timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+  });
+});
+
+/**
+ * Readiness check endpoint - indicates if service is ready to accept requests
+ */
+app.get('/ready', (req: Request, res: Response) => {
+  if (isShuttingDown) {
+    return res.status(503).json({
+      status: 'not ready',
+      reason: 'shutting down',
+    });
+  }
+  res.json({
+    status: 'ready',
+    service: 'pdf-splitter-api',
   });
 });
 
@@ -391,8 +484,11 @@ app.post(
   '/split',
   upload.single('file'),
   async (req: Request, res: Response, next: NextFunction) => {
+    const requestId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     let outputDir: string | null = null;
     let jobId: string | null = null;
+
+    console.log(`[${requestId}] New split request received`);
 
     try {
       // Clean up old jobs before processing
@@ -400,6 +496,7 @@ app.post(
 
       // Validate file upload
       if (!req.file) {
+        console.log(`[${requestId}] Error: No file uploaded`);
         return res.status(400).json({
           success: false,
           error: 'No PDF file uploaded. Please include a file in the "file" field.',
@@ -417,6 +514,7 @@ app.post(
           throw new Error('Ranges must be a non-empty array');
         }
       } catch (error) {
+        console.log(`[${requestId}] Error: Invalid ranges format`);
         return res.status(400).json({
           success: false,
           error: `Invalid ranges format: ${
@@ -434,26 +532,30 @@ app.post(
       outputDir = join(tmpdir(), 'pdf-splitter-output', jobId);
       await ensureOutputDirectory(outputDir);
 
-      console.log(`\nProcessing PDF split request:`);
-      console.log(`- Job ID: ${jobId}`);
-      console.log(`- File size: ${req.file.size} bytes`);
-      console.log(`- Ranges count: ${ranges.length}`);
-      console.log(`- Format: ${useZipFormat ? 'ZIP' : 'JSON'}`);
-      console.log(`- Output dir: ${outputDir}`);
+      console.log(`[${requestId}] Processing PDF split:`);
+      console.log(`  - Job ID: ${jobId}`);
+      console.log(`  - File size: ${req.file.size} bytes`);
+      console.log(`  - Ranges count: ${ranges.length}`);
+      console.log(`  - Format: ${useZipFormat ? 'ZIP' : 'JSON'}`);
+      console.log(`  - Output dir: ${outputDir}`);
 
       // Process the PDF split
+      // Upload to R2 in JSON mode, skip in ZIP mode (for faster streaming)
       const { totalPages, results } = await splitPdfFromBuffer(
         req.file.buffer,
         ranges,
-        outputDir
+        outputDir,
+        jobId,
+        !useZipFormat // Upload to R2 only in JSON mode
       );
 
-      console.log(`✓ Split complete: ${results.length} files created`);
+      console.log(`[${requestId}] ✓ Split complete: ${results.length} files created`);
 
-      // Build base URL for download links
+      // Build base URL for download links (fallback for local files)
       const baseUrl = getBaseUrl(req);
 
       // Create manifest with download URLs
+      // Use R2 URLs if available, otherwise use local file URLs
       const manifest: Manifest = {
         totalPages,
         submissionCount: results.length,
@@ -461,13 +563,13 @@ app.post(
           submission_id: r.submission_id,
           fileName: r.fileName,
           pageCount: r.pageCount,
-          download_url: `${baseUrl}/jobs/${jobId}/${r.fileName}`,
+          download_url: r.r2Url || `${baseUrl}/jobs/${jobId}/${r.fileName}`,
         })),
       };
 
       if (useZipFormat) {
         // ZIP MODE: Stream ZIP file and clean up immediately after
-        console.log(`✓ Returning ZIP format`);
+        console.log(`[${requestId}] ✓ Returning ZIP format`);
 
         // Set response headers for ZIP download
         res.setHeader('Content-Type', 'application/zip');
@@ -480,7 +582,7 @@ app.post(
 
         // Handle archive errors
         archive.on('error', (err) => {
-          console.error('Archive error:', err);
+          console.error(`[${requestId}] Archive error:`, err);
           throw err;
         });
 
@@ -504,28 +606,33 @@ app.post(
         };
         archive.append(JSON.stringify(zipManifest, null, 2), { name: 'manifest.json' });
 
-        console.log(`✓ Streaming ZIP with ${results.length} PDFs + manifest.json`);
+        console.log(`[${requestId}] ✓ Streaming ZIP with ${results.length} PDFs + manifest.json`);
 
         // Finalize the archive (this will trigger streaming to the client)
         await archive.finalize();
 
-        console.log(`✓ ZIP sent successfully\n`);
+        console.log(`[${requestId}] ✓ ZIP sent successfully`);
 
         // Clean up temp files immediately in ZIP mode
         setImmediate(async () => {
           if (outputDir) {
             try {
               await rm(outputDir, { recursive: true, force: true });
-              console.log(`✓ Cleaned up temp directory: ${outputDir}`);
+              console.log(`[${requestId}] ✓ Cleaned up temp directory: ${outputDir}`);
             } catch (err) {
-              console.error(`Failed to clean up ${outputDir}:`, err);
+              console.error(`[${requestId}] Failed to clean up ${outputDir}:`, err);
             }
           }
         });
 
       } else {
         // JSON MODE: Register job and return URLs
-        console.log(`✓ Returning JSON format with download URLs`);
+        console.log(`[${requestId}] ✓ Returning JSON format with download URLs`);
+
+        // Collect R2 keys for cleanup
+        const r2Keys = results
+          .map(r => r.r2Key)
+          .filter((key): key is string => key !== undefined);
 
         // Register the job in the registry
         jobRegistry.set(jobId, {
@@ -533,6 +640,7 @@ app.post(
           directory: outputDir,
           createdAt: Date.now(),
           manifest,
+          r2Keys,
         });
 
         // Return JSON response with download URLs
@@ -543,20 +651,23 @@ app.post(
           results: manifest.results,
         };
 
-        console.log(`✓ Job registered: ${jobId}`);
-        console.log(`✓ Files available for 60 minutes\n`);
+        console.log(`[${requestId}] ✓ Job registered: ${jobId}`);
+        console.log(`[${requestId}] ✓ Files available at: ${r2Keys.length > 0 ? 'R2 (persistent)' : 'local (60 minutes)'}`);
+        console.log(`[${requestId}] ✓ Files stored in R2: ${r2Keys.length} of ${results.length}`);
 
         res.json(response);
       }
 
     } catch (error) {
+      console.error(`[${requestId}] Error processing request:`, error);
+
       // Clean up on error
       if (outputDir && !jobId) {
         // Only clean up if job wasn't registered
         try {
           await rm(outputDir, { recursive: true, force: true });
         } catch (err) {
-          console.error(`Failed to clean up ${outputDir}:`, err);
+          console.error(`[${requestId}] Failed to clean up ${outputDir}:`, err);
         }
       }
       next(error);
@@ -716,7 +827,7 @@ app.delete('/jobs/:jobId', async (req: Request, res: Response) => {
 app.use((req: Request, res: Response) => {
   res.status(404).json({
     success: false,
-    error: 'Endpoint not found. Available endpoints: GET /health, POST /split, GET /jobs/:jobId/:fileName, GET /jobs/:jobId/manifest.json, DELETE /jobs/:jobId',
+    error: 'Endpoint not found. Available endpoints: GET /health, GET /ready, POST /split, GET /jobs/:jobId/:fileName, GET /jobs/:jobId/manifest.json, DELETE /jobs/:jobId',
   } as ErrorResponse);
 });
 
@@ -734,19 +845,81 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
 });
 
 /**
+ * Graceful shutdown handler
+ */
+async function gracefulShutdown(signal: string): Promise<void> {
+  console.log(`\n${signal} received - starting graceful shutdown`);
+  isShuttingDown = true;
+
+  // Stop accepting new connections
+  server.close(async () => {
+    console.log('✓ HTTP server closed');
+
+    // Clean up resources
+    try {
+      console.log('Cleaning up resources...');
+      // Add any cleanup logic here if needed
+      console.log('✓ Resources cleaned up');
+      process.exit(0);
+    } catch (error) {
+      console.error('Error during cleanup:', error);
+      process.exit(1);
+    }
+  });
+
+  // Force shutdown after 30 seconds if graceful shutdown hangs
+  setTimeout(() => {
+    console.error('Could not close connections in time, forcefully shutting down');
+    process.exit(1);
+  }, 30000);
+}
+
+// Register signal handlers
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Handle uncaught errors
+process.on('uncaughtException', (error: Error) => {
+  console.error('Uncaught Exception:', error);
+  gracefulShutdown('UNCAUGHT_EXCEPTION');
+});
+
+process.on('unhandledRejection', (reason: any) => {
+  console.error('Unhandled Rejection:', reason);
+  gracefulShutdown('UNHANDLED_REJECTION');
+});
+
+/**
  * Start the server
  */
-app.listen(PORT, () => {
+server = app.listen(PORT, HOST, async () => {
   console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║              PDF Splitter API - Running                   ║
 ╠════════════════════════════════════════════════════════════╣
 ║  Port:        ${PORT.toString().padEnd(43)}║
+║  Host:        ${HOST.padEnd(43)}║
 ║  Environment: ${(process.env.NODE_ENV || 'development').padEnd(43)}║
 ║  Health:      http://localhost:${PORT}/health${' '.repeat(24)}║
+║  Ready:       http://localhost:${PORT}/ready${' '.repeat(25)}║
 ║  Split API:   POST http://localhost:${PORT}/split${' '.repeat(20)}║
 ╚════════════════════════════════════════════════════════════╝
   `);
+
+  // Test R2 connection on startup (non-blocking)
+  console.log('Testing R2 connection...');
+  testR2Connection()
+    .then(r2Connected => {
+      if (r2Connected) {
+        console.log('✓ R2 storage is enabled - PDFs will be persisted\n');
+      } else {
+        console.log('⚠️  R2 storage is disabled - PDFs will use local storage only\n');
+      }
+    })
+    .catch(err => {
+      console.error('⚠️  R2 connection test failed:', err.message);
+      console.log('⚠️  R2 storage is disabled - PDFs will use local storage only\n');
+    });
 });
 
 // Export for testing
