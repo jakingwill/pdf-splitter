@@ -21,6 +21,8 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import archiver from 'archiver';
 import { uploadToR2, deleteFromR2, generateR2Key, testR2Connection, R2_ENABLED } from './r2-client.js';
+import { randomUUID } from 'crypto';
+
 
 /**
  * Represents a page range for splitting the PDF
@@ -488,7 +490,7 @@ app.post(
       const useZipFormat = format === 'zip';
 
       // Create job ID and output directory
-      jobId = Date.now().toString();
+      jobId = randomUUID();
       outputDir = join(tmpdir(), 'pdf-splitter-output', jobId);
       await ensureOutputDirectory(outputDir);
 
