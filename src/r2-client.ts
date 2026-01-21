@@ -9,8 +9,8 @@ import { S3Client, PutObjectCommand, DeleteObjectCommand, HeadBucketCommand } fr
 
 // R2 Configuration from environment variables
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || 'f5356646acd5bdb980d4f90195ba873a';
-const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || '2f8caf290402d4045c073c4c2828cc55';
-const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || 'b8822af2eb9d3e5689d2d5af0460e48c3f3b8e13dfbbfe8081666dc696484292';
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
 const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME || 'pdf-splitter-storage';
 const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || 'https://pub-bee39d9da3be44ad88f107fe87be5a16.r2.dev';
 
