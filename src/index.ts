@@ -261,17 +261,6 @@ async function deleteJob(jobId: string): Promise<boolean> {
   }
 
   try {
-    // Delete R2 files first
-    if (job.r2Keys && job.r2Keys.length > 0) {
-      for (const r2Key of job.r2Keys) {
-        try {
-          await deleteFromR2(r2Key);
-          console.log(`  ✓ Deleted from R2: ${r2Key}`);
-        } catch (err) {
-          console.error(`  ⚠ Failed to delete from R2: ${r2Key}`, err);
-        }
-      }
-    }
 
     // Delete local directory
     await rm(job.directory, { recursive: true, force: true });
