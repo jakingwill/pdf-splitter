@@ -223,6 +223,7 @@ function isValidFileName(fileName: string): boolean {
 
 /**
  * Cleans up old job directories (older than JOB_RETENTION_MS)
+ * NOTE: R2 files are NOT deleted - they remain persistent for user access
  */
 async function cleanupOldJobs(): Promise<void> {
   const now = Date.now();
@@ -240,22 +241,13 @@ async function cleanupOldJobs(): Promise<void> {
     const job = jobRegistry.get(jobId);
     if (job) {
       try {
-        // Delete R2 files first
-        if (job.r2Keys && job.r2Keys.length > 0) {
-          for (const r2Key of job.r2Keys) {
-            try {
-              await deleteFromR2(r2Key);
-              console.log(`  ✓ Deleted from R2: ${r2Key}`);
-            } catch (err) {
-              console.error(`  ⚠ Failed to delete from R2: ${r2Key}`, err);
-            }
-          }
-        }
+        // NOTE: We do NOT delete R2 files here - they remain persistent
+        // Only local temporary files are cleaned up
 
-        // Delete local directory
+        // Delete local directory only
         await rm(job.directory, { recursive: true, force: true });
         jobRegistry.delete(jobId);
-        console.log(`✓ Cleaned up old job: ${jobId}`);
+        console.log(`✓ Cleaned up old job: ${jobId} (local files only, R2 files preserved)`);
       } catch (err) {
         console.error(`Failed to clean up job ${jobId}:`, err);
       }
@@ -263,12 +255,13 @@ async function cleanupOldJobs(): Promise<void> {
   }
 
   if (jobsToDelete.length > 0) {
-    console.log(`✓ Cleaned up ${jobsToDelete.length} old job(s)`);
+    console.log(`✓ Cleaned up ${jobsToDelete.length} old job(s) - R2 files preserved for persistent access`);
   }
 }
 
 /**
  * Deletes a specific job by jobId
+ * NOTE: R2 files are NOT deleted - they remain persistent for user access
  */
 async function deleteJob(jobId: string): Promise<boolean> {
   const job = jobRegistry.get(jobId);
@@ -277,22 +270,13 @@ async function deleteJob(jobId: string): Promise<boolean> {
   }
 
   try {
-    // Delete R2 files first
-    if (job.r2Keys && job.r2Keys.length > 0) {
-      for (const r2Key of job.r2Keys) {
-        try {
-          await deleteFromR2(r2Key);
-          console.log(`  ✓ Deleted from R2: ${r2Key}`);
-        } catch (err) {
-          console.error(`  ⚠ Failed to delete from R2: ${r2Key}`, err);
-        }
-      }
-    }
+    // NOTE: We do NOT delete R2 files here - they remain persistent
+    // Only local temporary files are cleaned up
 
-    // Delete local directory
+    // Delete local directory only
     await rm(job.directory, { recursive: true, force: true });
     jobRegistry.delete(jobId);
-    console.log(`✓ Deleted job: ${jobId}`);
+    console.log(`✓ Deleted job: ${jobId} (local files only, R2 files preserved)`);
     return true;
   } catch (err) {
     console.error(`Failed to delete job ${jobId}:`, err);
@@ -652,7 +636,7 @@ app.post(
         };
 
         console.log(`[${requestId}] ✓ Job registered: ${jobId}`);
-        console.log(`[${requestId}] ✓ Files available at: ${r2Keys.length > 0 ? 'R2 (persistent)' : 'local (60 minutes)'}`);
+        console.log(`[${requestId}] ✓ Files available at: ${r2Keys.length > 0 ? 'R2 (permanent/persistent)' : 'local (60 minutes)'}`);
         console.log(`[${requestId}] ✓ Files stored in R2: ${r2Keys.length} of ${results.length}`);
 
         res.json(response);

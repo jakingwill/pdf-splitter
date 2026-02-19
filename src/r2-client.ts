@@ -3,6 +3,9 @@
  *
  * This module configures the AWS SDK to work with Cloudflare R2
  * for persistent storage of split PDF files.
+ *
+ * IMPORTANT: Files uploaded to R2 are PERSISTENT and will NOT be automatically deleted.
+ * They remain available for users to access indefinitely.
  */
 
 import { S3Client, PutObjectCommand, DeleteObjectCommand, HeadBucketCommand } from '@aws-sdk/client-s3';
